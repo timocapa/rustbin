@@ -271,7 +271,8 @@ textarea {
     color: var(--fg);
     padding: 0;
     width: 100%;
-    height: 100vh;
+    height: calc(100vh - var(--footer-h));
+    height: calc(100dvh - var(--footer-h));
     font-family: inherit;
     outline: none;
     resize: vertical;
@@ -315,6 +316,10 @@ body > hr,
 body > div.notice {
     margin-left: 16px;
     margin-right: 16px;
+}
+
+body > pre {
+    width: auto;
 }
 
 body > h1 {
@@ -503,4 +508,23 @@ body > hr {
 
 .markdown-body .footnote-definition p {
     display: inline;
+}
+
+@media (max-width: 640px) {
+    .foot {
+        height: auto;
+        min-height: 40px;
+        flex-wrap: wrap;
+        row-gap: 8px;
+    }
+
+    .foot-end {
+        flex-wrap: wrap-reverse;
+        row-gap: 8px;
+    }
+
+    .kopirite {
+        height: auto;
+        min-height: 32px;
+    }
 }"#;

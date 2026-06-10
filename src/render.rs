@@ -34,7 +34,7 @@ pub fn usage_page() -> Markup {
         None,
         html! {
             h1 { "Rustbin" }
-            "A minimalist pastebin and URL shortener written in rust."
+            p { "A minimalist pastebin and URL shortener written in rust." }
             hr;
             br;
             h2 { "Usage" }
@@ -188,7 +188,7 @@ fn page(
                 meta charset="UTF-8";
                 title { (title) }
                 link rel="shortcut icon" type="image/x-icon" href="/favicon.ico";
-                meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no";
+                meta name="viewport" content="width=device-width, initial-scale=1.0";
                 link rel="preconnect" href="https://fonts.googleapis.com";
                 link rel="preconnect" href="https://fonts.gstatic.com" crossorigin;
                 link rel="stylesheet" href=(FONT_URL);
