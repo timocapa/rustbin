@@ -365,7 +365,7 @@ body > hr {
     padding: 32px 40px;
     line-height: 1.6;
     word-wrap: break-word;
-    max-width: 900px;
+    width: 100%;
     /* Same viewport-height scroll container as .paste-content. */
     height: calc(100vh - var(--footer-h));
     height: calc(100dvh - var(--footer-h));
