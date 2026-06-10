@@ -6,8 +6,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::{
     constants::{APP_CSS, FONT_URL, PASTE_JS},
-    response::Template,
-    state::Paste,
+    response::{PlainAlternate, Template},
 };
 
 pub fn index_page(error_message: Option<&str>) -> Markup {
@@ -75,7 +74,9 @@ pub fn usage_page() -> Markup {
                 code { "/{id}" }
                 " to view a paste and "
                 code { "/{id}/raw" }
-                " for plain text."
+                " for plain text. CLI clients like "
+                code { "curl" }
+                " always receive plain text."
             }
             br;
             br;
@@ -128,14 +129,31 @@ pub fn url_paste_page(short_url: &str, destination: &str) -> Markup {
     )
 }
 
-pub fn paste_page(paste_ref: &str, paste: &Paste, content_html: &str, is_markdown: bool) -> Markup {
+pub struct PastePage<'a> {
+    /// Request origin (scheme://host) for the absolute og:image/twitter:image
+    /// URLs — crawlers ignore relative image URLs.
+    pub origin: &'a str,
+    pub paste_ref: &'a str,
+    pub paste_id: &'a str,
+    pub content_html: &'a str,
+    pub is_markdown: bool,
+}
+
+pub fn paste_page(spec: &PastePage<'_>) -> Markup {
+    let PastePage {
+        origin,
+        paste_ref,
+        paste_id,
+        content_html,
+        is_markdown,
+    } = *spec;
     page(
         &format!("{paste_ref} | Rustbin"),
         Some(html! {
             meta name="twitter:card" content="summary_large_image";
-            meta name="twitter:image" content={ "/" (paste_ref) "/preview.png" };
+            meta name="twitter:image" content={ (origin) "/" (paste_ref) "/preview.png" };
             meta property="og:type" content="website";
-            meta property="og:image" content={ "/" (paste_ref) "/preview.png" };
+            meta property="og:image" content={ (origin) "/" (paste_ref) "/preview.png" };
         }),
         if is_markdown {
             None
@@ -143,12 +161,16 @@ pub fn paste_page(paste_ref: &str, paste: &Paste, content_html: &str, is_markdow
             Some(html! { script { (PreEscaped(PASTE_JS)) } })
         },
         html! {
+            // Footer first: it's position:fixed, so DOM order only decides
+            // when it paints — after the content it wouldn't show until the
+            // browser finishes parsing a possibly multi-megabyte paste,
+            // leaving a bare strip under the scrollbar on refresh.
+            (footer_paste(paste_id))
             @if is_markdown {
                 (render_markdown_block(content_html))
             } @else {
                 (render_content_block(content_html))
             }
-            (footer_paste(&paste.id))
         },
     )
 }
@@ -186,11 +208,11 @@ fn page(
 }
 
 fn render_content_block(content_html: &str) -> Markup {
+    // content_html already carries its .code-grid wrapper (the renderer sets
+    // the gutter-width CSS variable on it).
     html! {
         pre class="paste-content" {
-            div class="code-grid" {
-                (PreEscaped(content_html))
-            }
+            (PreEscaped(content_html))
         }
     }
 }
@@ -204,7 +226,11 @@ fn render_markdown_block(content_html: &str) -> Markup {
 }
 
 pub fn render_error_response(status: StatusCode, code: &str, message: &str) -> Response {
-    (status, Template(error_page(code, message))).into_response()
+    let mut response = (status, Template(error_page(code, message))).into_response();
+    response
+        .extensions_mut()
+        .insert(PlainAlternate(format!("{code}: {message}\n")));
+    response
 }
 
 fn error_page(code: &str, message: &str) -> Markup {
@@ -243,7 +269,10 @@ fn footer_home() -> Markup {
 }
 
 fn footer_paste(id: &str) -> Markup {
-    footer_layout(
+    // No .foot-spacer: the paste view is a viewport-height scroll container
+    // sized to end above the fixed footer, so the document itself never
+    // scrolls — a spacer would only add a phantom body scrollbar.
+    footer_bar(
         html! {},
         html! {
             span class="foot-hover" {
@@ -259,6 +288,12 @@ fn footer_paste(id: &str) -> Markup {
 fn footer_layout(brand_suffix: Markup, actions: Markup) -> Markup {
     html! {
         span class="foot-spacer" {}
+        (footer_bar(brand_suffix, actions))
+    }
+}
+
+fn footer_bar(brand_suffix: Markup, actions: Markup) -> Markup {
+    html! {
         footer class="foot-minibuf" {
             div class="foot" {
                 img src="/logo.png" height="24" class="foot-logo";

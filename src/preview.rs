@@ -1,11 +1,14 @@
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, hash_map::Entry},
+};
 
 use fontdue::{Font, FontSettings};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use syntect::{easy::HighlightLines, highlighting::Style, util::LinesWithEndings};
 
 use crate::{
-    highlighter::{is_markdown, resolve_syntax},
+    highlighter::{MARKDOWN_OPTIONS, is_markdown, resolve_syntax, trim_line_ending},
     state::AppState,
 };
 
@@ -18,6 +21,18 @@ const PADDING_Y: usize = 14;
 const MAX_LINES: usize = 25;
 const LINE_NUMBER_WIDTH: usize = 44;
 const TAB_WIDTH: usize = 4;
+
+/// Only ~150 columns fit in the image, so cap how much of a single line is
+/// highlighted/rasterized — without this a multi-MB one-line paste burns
+/// seconds of syntect work per preview.
+const PREVIEW_MAX_LINE_BYTES: usize = 1024;
+/// Budget for markdown preview input; the image fits ~30 rendered lines, so
+/// parsing/highlighting beyond this is wasted work.
+const PREVIEW_MD_MAX_BYTES: usize = 64 * 1024;
+/// Styled-line cap shared by the markdown event loop and the code-block
+/// renderer it calls (the event loop's own check runs only between events, so
+/// the code-block path must enforce it too).
+const MD_PREVIEW_MAX_LINES: usize = 60;
 
 const BG_R: u8 = 0x0a;
 const BG_G: u8 = 0x0c;
@@ -61,6 +76,50 @@ const MD_H2_SIZE: f32 = 21.0; // 1.5em
 const MD_H3_SIZE: f32 = 17.5; // 1.25em
 const MD_CODE_SIZE: f32 = 12.0; // .85em
 
+#[derive(Clone, Copy)]
+struct Rgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl Rgb {
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// Blend toward the page background, channel by channel.
+    fn faded(self, alpha_factor: u8) -> Self {
+        Self {
+            r: apply_alpha_channel(self.r, BG_R, alpha_factor),
+            g: apply_alpha_channel(self.g, BG_G, alpha_factor),
+            b: apply_alpha_channel(self.b, BG_B, alpha_factor),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Point {
+    x: usize,
+    y: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+struct TextSpec {
+    pos: Point,
+    color: Rgb,
+    font_size: f32,
+    line_height: usize,
+    max_x: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct GlyphCacheKey {
     ch: char,
@@ -81,6 +140,17 @@ struct GlyphCache {
     glyphs: HashMap<GlyphCacheKey, CachedGlyph>,
 }
 
+thread_local! {
+    /// Rasterized glyphs are identical across previews (one embedded font, a
+    /// handful of sizes), so each blocking-pool thread keeps its cache across
+    /// calls instead of re-rasterizing every glyph for every preview.
+    static GLYPH_CACHE: RefCell<GlyphCache> = RefCell::new(GlyphCache::default());
+}
+
+/// Safety valve for pathological unicode-heavy pastes; ordinary use stays far
+/// below this.
+const GLYPH_CACHE_MAX_GLYPHS: usize = 4096;
+
 pub fn load_font() -> Font {
     let font_data = include_bytes!("../font/DMMono-Regular.ttf");
     Font::from_bytes(font_data as &[u8], FontSettings::default())
@@ -88,20 +158,35 @@ pub fn load_font() -> Font {
 }
 
 pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>) -> Vec<u8> {
-    let mut pixels = [BG_R, BG_G, BG_B, 255u8].repeat(WIDTH * HEIGHT);
-    let mut glyph_cache = GlyphCache::default();
+    GLYPH_CACHE.with(|cache| {
+        let mut glyph_cache = cache.borrow_mut();
+        if glyph_cache.glyphs.len() > GLYPH_CACHE_MAX_GLYPHS {
+            glyph_cache.glyphs.clear();
+        }
+        generate_preview_with_cache(state, content, extension, &mut glyph_cache)
+    })
+}
+
+fn generate_preview_with_cache(
+    state: &AppState,
+    content: &str,
+    extension: Option<&str>,
+    glyph_cache: &mut GlyphCache,
+) -> Vec<u8> {
+    let mut pixels = [BG_R, BG_G, BG_B].repeat(WIDTH * HEIGHT);
 
     if content.is_empty() {
         return encode_png(&pixels);
     }
 
     if is_markdown(extension) {
-        return generate_markdown_preview(state, &mut pixels, content, &mut glyph_cache);
+        return generate_markdown_preview(state, &mut pixels, content, glyph_cache);
     }
 
     let syntax = resolve_syntax(state, extension);
     let lines: Vec<&str> = LinesWithEndings::from(content)
         .take(MAX_LINES + 1)
+        .map(|line| truncate_line_bytes(line, PREVIEW_MAX_LINE_BYTES))
         .collect();
     let has_more = lines.len() > MAX_LINES;
     let visible_lines = if has_more { MAX_LINES } else { lines.len() };
@@ -126,13 +211,13 @@ pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>
         render_text_right_aligned(
             &mut pixels,
             font,
-            &mut glyph_cache,
+            glyph_cache,
             num_str,
-            PADDING_X + LINE_NUMBER_WIDTH - 8,
-            y_offset,
-            MUTED_R,
-            MUTED_G,
-            MUTED_B,
+            Point {
+                x: PADDING_X + LINE_NUMBER_WIDTH - 8,
+                y: y_offset,
+            },
+            Rgb::new(MUTED_R, MUTED_G, MUTED_B),
         );
 
         // Determine fade factor for last 3 lines if there's more content
@@ -157,7 +242,7 @@ pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>
                     render_highlighted_regions(
                         &mut pixels,
                         font,
-                        &mut glyph_cache,
+                        glyph_cache,
                         &regions,
                         content_x,
                         y_offset,
@@ -168,13 +253,13 @@ pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>
                     render_text(
                         &mut pixels,
                         font,
-                        &mut glyph_cache,
+                        glyph_cache,
                         trimmed,
-                        content_x,
-                        y_offset,
-                        apply_alpha(FG_R, alpha_factor),
-                        apply_alpha(FG_G, alpha_factor),
-                        apply_alpha(FG_B, alpha_factor),
+                        Point {
+                            x: content_x,
+                            y: y_offset,
+                        },
+                        Rgb::new(FG_R, FG_G, FG_B).faded(alpha_factor),
                     );
                 }
             }
@@ -182,13 +267,13 @@ pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>
             render_text(
                 &mut pixels,
                 font,
-                &mut glyph_cache,
+                glyph_cache,
                 trimmed,
-                content_x,
-                y_offset,
-                apply_alpha(FG_R, alpha_factor),
-                apply_alpha(FG_G, alpha_factor),
-                apply_alpha(FG_B, alpha_factor),
+                Point {
+                    x: content_x,
+                    y: y_offset,
+                },
+                Rgb::new(FG_R, FG_G, FG_B).faded(alpha_factor),
             );
         }
     }
@@ -201,13 +286,13 @@ pub fn generate_preview(state: &AppState, content: &str, extension: Option<&str>
             render_text(
                 &mut pixels,
                 font,
-                &mut glyph_cache,
+                glyph_cache,
                 "...",
-                content_x,
-                dots_y,
-                MUTED_R,
-                MUTED_G,
-                MUTED_B,
+                Point {
+                    x: content_x,
+                    y: dots_y,
+                },
+                Rgb::new(MUTED_R, MUTED_G, MUTED_B),
             );
         }
     }
@@ -298,6 +383,13 @@ fn generate_markdown_preview(
     content: &str,
     glyph_cache: &mut GlyphCache,
 ) -> Vec<u8> {
+    // The image fits ~30 lines; parsing megabytes of markdown for it is wasted
+    // work (the styled-line cap alone doesn't bound a single huge code block).
+    let (content, _) = crate::highlighter::truncate_for_render(
+        content,
+        PREVIEW_MD_MAX_BYTES,
+        MD_PREVIEW_MAX_LINES * 8,
+    );
     let lines = markdown_to_styled_lines(state, content);
 
     let font = &state.font;
@@ -339,45 +431,45 @@ fn generate_markdown_preview(
         if line.blockquote_depth > 0 {
             for depth in 0..line.blockquote_depth {
                 let border_x = MD_PADDING_X + depth * 16;
-                let br = apply_alpha(BORDER_R, alpha_factor);
-                let bg = apply_alpha_channel(BORDER_G, BG_G, alpha_factor);
-                let bb = apply_alpha_channel(BORDER_B, BG_B, alpha_factor);
-                fill_rect(pixels, border_x, y, 3, line.line_height, br, bg, bb);
+                fill_rect(
+                    pixels,
+                    Rect {
+                        x: border_x,
+                        y,
+                        w: 3,
+                        h: line.line_height,
+                    },
+                    Rgb::new(BORDER_R, BORDER_G, BORDER_B).faded(alpha_factor),
+                );
             }
         }
 
         // Draw code block background
         if line.is_code_block {
-            let bg_r = apply_alpha_channel(PANEL2_R, BG_R, alpha_factor);
-            let bg_g = apply_alpha_channel(PANEL2_G, BG_G, alpha_factor);
-            let bg_b = apply_alpha_channel(PANEL2_B, BG_B, alpha_factor);
             fill_rect(
                 pixels,
-                content_x,
-                y,
-                WIDTH - content_x - MD_PADDING_X,
-                line.line_height,
-                bg_r,
-                bg_g,
-                bg_b,
+                Rect {
+                    x: content_x,
+                    y,
+                    w: WIDTH - content_x - MD_PADDING_X,
+                    h: line.line_height,
+                },
+                Rgb::new(PANEL2_R, PANEL2_G, PANEL2_B).faded(alpha_factor),
             );
         }
 
         // Draw horizontal rule
         if line.is_rule {
             let hr_y = y + line.line_height / 2;
-            let hr_r = apply_alpha(BORDER_R, alpha_factor);
-            let hr_g = apply_alpha_channel(BORDER_G, BG_G, alpha_factor);
-            let hr_b = apply_alpha_channel(BORDER_B, BG_B, alpha_factor);
             fill_rect(
                 pixels,
-                content_x,
-                hr_y,
-                WIDTH - content_x - MD_PADDING_X,
-                3,
-                hr_r,
-                hr_g,
-                hr_b,
+                Rect {
+                    x: content_x,
+                    y: hr_y,
+                    w: WIDTH - content_x - MD_PADDING_X,
+                    h: 3,
+                },
+                Rgb::new(BORDER_R, BORDER_G, BORDER_B).faded(alpha_factor),
             );
         } else {
             // Render text spans
@@ -388,28 +480,23 @@ fn generate_markdown_preview(
             };
             let mut cursor_x = text_x;
             for span in &line.spans {
-                let r = apply_alpha(span.r, alpha_factor);
-                let g = apply_alpha_channel(span.g, BG_G, alpha_factor);
-                let b = apply_alpha_channel(span.b, BG_B, alpha_factor);
+                let color = Rgb::new(span.r, span.g, span.b).faded(alpha_factor);
 
                 // Draw inline code background
                 if span.has_bg {
                     let text_w = measure_text_width(glyph_cache, font, &span.text, span.font_size);
                     let pad = 3;
-                    let bg_r = apply_alpha_channel(PANEL_R, BG_R, alpha_factor);
-                    let bg_g = apply_alpha_channel(PANEL_G, BG_G, alpha_factor);
-                    let bg_b = apply_alpha_channel(PANEL_B, BG_B, alpha_factor);
                     let bg_y = y + 2;
                     let bg_h = line.line_height.saturating_sub(4);
                     fill_rect(
                         pixels,
-                        cursor_x.saturating_sub(pad),
-                        bg_y,
-                        text_w + pad * 2,
-                        bg_h,
-                        bg_r,
-                        bg_g,
-                        bg_b,
+                        Rect {
+                            x: cursor_x.saturating_sub(pad),
+                            y: bg_y,
+                            w: text_w + pad * 2,
+                            h: bg_h,
+                        },
+                        Rgb::new(PANEL_R, PANEL_G, PANEL_B).faded(alpha_factor),
                     );
                 }
 
@@ -418,14 +505,13 @@ fn generate_markdown_preview(
                     font,
                     glyph_cache,
                     &span.text,
-                    cursor_x,
-                    y,
-                    r,
-                    g,
-                    b,
-                    span.font_size,
-                    line.line_height,
-                    WIDTH - MD_PADDING_X,
+                    TextSpec {
+                        pos: Point { x: cursor_x, y },
+                        color,
+                        font_size: span.font_size,
+                        line_height: line.line_height,
+                        max_x: WIDTH - MD_PADDING_X,
+                    },
                 );
             }
         }
@@ -433,18 +519,15 @@ fn generate_markdown_preview(
         // Draw h1/h2 underline
         if line.has_underline {
             let ul_y = y + line.line_height - 2;
-            let ul_r = apply_alpha(BORDER_R, alpha_factor);
-            let ul_g = apply_alpha_channel(BORDER_G, BG_G, alpha_factor);
-            let ul_b = apply_alpha_channel(BORDER_B, BG_B, alpha_factor);
             fill_rect(
                 pixels,
-                content_x,
-                ul_y,
-                WIDTH - content_x - MD_PADDING_X,
-                1,
-                ul_r,
-                ul_g,
-                ul_b,
+                Rect {
+                    x: content_x,
+                    y: ul_y,
+                    w: WIDTH - content_x - MD_PADDING_X,
+                    h: 1,
+                },
+                Rgb::new(BORDER_R, BORDER_G, BORDER_B).faded(alpha_factor),
             );
         }
 
@@ -457,11 +540,8 @@ fn generate_markdown_preview(
             font,
             glyph_cache,
             "...",
-            MD_PADDING_X,
-            y,
-            MUTED_R,
-            MUTED_G,
-            MUTED_B,
+            Point { x: MD_PADDING_X, y },
+            Rgb::new(MUTED_R, MUTED_G, MUTED_B),
         );
     }
 
@@ -470,14 +550,7 @@ fn generate_markdown_preview(
 
 /// Parse markdown with pulldown-cmark and produce styled lines for the preview image.
 fn markdown_to_styled_lines(state: &AppState, content: &str) -> Vec<MdLine> {
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_HEADING_ATTRIBUTES
-        | Options::ENABLE_SMART_PUNCTUATION;
-
-    let parser = Parser::new_ext(content, options);
+    let parser = Parser::new_ext(content, MARKDOWN_OPTIONS);
 
     let mut lines: Vec<MdLine> = Vec::new();
     let mut current_spans: Vec<MdSpan> = Vec::new();
@@ -492,8 +565,6 @@ fn markdown_to_styled_lines(state: &AppState, content: &str) -> Vec<MdLine> {
     let mut list_indent: usize = 0;
     let mut ordered_index: Option<u64> = None;
     let mut need_block_gap = false;
-
-    let max_lines = 60; // generous limit; we trim by pixel height later
 
     for event in parser {
         match event {
@@ -685,7 +756,7 @@ fn markdown_to_styled_lines(state: &AppState, content: &str) -> Vec<MdLine> {
             _ => {}
         }
 
-        if lines.len() > max_lines {
+        if lines.len() > MD_PREVIEW_MAX_LINES {
             break;
         }
     }
@@ -712,6 +783,13 @@ fn render_code_block_to_md_lines(
     if let Some(syntax) = syntax {
         let mut hl = HighlightLines::new(syntax, state.theme.as_ref());
         for line_text in LinesWithEndings::from(code) {
+            // The styled-line cap in markdown_to_styled_lines only runs
+            // between events; a single huge code block must stop here or it is
+            // fully highlighted before the cap is ever checked.
+            if lines.len() > MD_PREVIEW_MAX_LINES {
+                break;
+            }
+            let line_text = truncate_line_bytes(line_text, PREVIEW_MAX_LINE_BYTES);
             let mut spans: Vec<MdSpan> = Vec::new();
             match hl.highlight_line(line_text, &state.syntax_set) {
                 Ok(regions) => {
@@ -749,6 +827,10 @@ fn render_code_block_to_md_lines(
         }
     } else {
         for line_text in LinesWithEndings::from(code) {
+            if lines.len() > MD_PREVIEW_MAX_LINES {
+                break;
+            }
+            let line_text = truncate_line_bytes(line_text, PREVIEW_MAX_LINE_BYTES);
             lines.push(MdLine {
                 spans: vec![MdSpan::sized(
                     trim_line_ending(line_text).to_string(),
@@ -767,20 +849,33 @@ fn render_code_block_to_md_lines(
     }
 }
 
-fn fill_rect(pixels: &mut [u8], x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+fn fill_rect(pixels: &mut [u8], rect: Rect, color: Rgb) {
+    let Rect { x, y, w, h } = rect;
     if x >= WIDTH || y >= HEIGHT || w == 0 || h == 0 {
         return;
     }
     let x_end = (x + w).min(WIDTH);
     let y_end = (y + h).min(HEIGHT);
     for row in y..y_end {
-        let row_offset = row * WIDTH * 4;
-        for pixel in pixels[row_offset + x * 4..row_offset + x_end * 4].chunks_exact_mut(4) {
-            pixel[0] = r;
-            pixel[1] = g;
-            pixel[2] = b;
+        let row_offset = row * WIDTH * 3;
+        for pixel in pixels[row_offset + x * 3..row_offset + x_end * 3].chunks_exact_mut(3) {
+            pixel[0] = color.r;
+            pixel[1] = color.g;
+            pixel[2] = color.b;
         }
     }
+}
+
+/// Cap a single line to `max_bytes` without splitting a codepoint.
+fn truncate_line_bytes(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut end = max_bytes;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 fn measure_text_width(
@@ -808,17 +903,10 @@ fn render_text_sized(
     font: &Font,
     glyph_cache: &mut GlyphCache,
     text: &str,
-    start_x: usize,
-    y_offset: usize,
-    r: u8,
-    g: u8,
-    b: u8,
-    font_size: f32,
-    line_height: usize,
-    max_x: usize,
+    spec: TextSpec,
 ) -> usize {
-    let mut cursor_x = start_x;
-    let space_advance = glyph_advance(glyph_cache, font, ' ', font_size);
+    let mut cursor_x = spec.pos.x;
+    let space_advance = glyph_advance(glyph_cache, font, ' ', spec.font_size);
 
     for ch in text.chars() {
         if ch == '\t' {
@@ -826,30 +914,30 @@ fn render_text_sized(
             continue;
         }
 
-        if cursor_x >= max_x {
+        if cursor_x >= spec.max_x {
             break;
         }
 
-        let glyph = cached_glyph(glyph_cache, font, ch, font_size);
+        let glyph = cached_glyph(glyph_cache, font, ch, spec.font_size);
         if glyph.width == 0 || glyph.height == 0 {
             cursor_x += glyph.advance_width;
             continue;
         }
 
-        draw_glyph(pixels, glyph, cursor_x, y_offset, line_height, r, g, b);
+        draw_glyph(
+            pixels,
+            glyph,
+            Point {
+                x: cursor_x,
+                y: spec.pos.y,
+            },
+            spec.line_height,
+            spec.color,
+        );
         cursor_x += glyph.advance_width;
     }
 
     cursor_x
-}
-
-fn apply_alpha(color: u8, alpha: u8) -> u8 {
-    if alpha == 255 {
-        return color;
-    }
-    // Blend with background
-    let bg = BG_R; // approximate - all bg channels are similar
-    ((color as u16 * alpha as u16 + bg as u16 * (255 - alpha as u16)) / 255) as u8
 }
 
 fn apply_alpha_channel(fg: u8, bg: u8, alpha: u8) -> u8 {
@@ -872,22 +960,23 @@ fn render_highlighted_regions(
 
     for &(style, text) in regions {
         let text = trim_line_ending(text);
-        let r = apply_alpha_channel(style.foreground.r, BG_R, alpha_factor);
-        let g = apply_alpha_channel(style.foreground.g, BG_G, alpha_factor);
-        let b = apply_alpha_channel(style.foreground.b, BG_B, alpha_factor);
+        let color = Rgb::new(style.foreground.r, style.foreground.g, style.foreground.b)
+            .faded(alpha_factor);
         cursor_x = render_text_sized(
             pixels,
             font,
             glyph_cache,
             text,
-            cursor_x,
-            y_offset,
-            r,
-            g,
-            b,
-            FONT_SIZE,
-            LINE_HEIGHT,
-            WIDTH - PADDING_X,
+            TextSpec {
+                pos: Point {
+                    x: cursor_x,
+                    y: y_offset,
+                },
+                color,
+                font_size: FONT_SIZE,
+                line_height: LINE_HEIGHT,
+                max_x: WIDTH - PADDING_X,
+            },
         );
     }
 }
@@ -897,40 +986,22 @@ fn render_text(
     font: &Font,
     glyph_cache: &mut GlyphCache,
     text: &str,
-    start_x: usize,
-    y_offset: usize,
-    r: u8,
-    g: u8,
-    b: u8,
+    pos: Point,
+    color: Rgb,
 ) {
-    render_text_returning_x(pixels, font, glyph_cache, text, start_x, y_offset, r, g, b);
-}
-
-fn render_text_returning_x(
-    pixels: &mut [u8],
-    font: &Font,
-    glyph_cache: &mut GlyphCache,
-    text: &str,
-    start_x: usize,
-    y_offset: usize,
-    r: u8,
-    g: u8,
-    b: u8,
-) -> usize {
     render_text_sized(
         pixels,
         font,
         glyph_cache,
         text,
-        start_x,
-        y_offset,
-        r,
-        g,
-        b,
-        FONT_SIZE,
-        LINE_HEIGHT,
-        WIDTH - PADDING_X,
-    )
+        TextSpec {
+            pos,
+            color,
+            font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
+            max_x: WIDTH - PADDING_X,
+        },
+    );
 }
 
 fn render_text_right_aligned(
@@ -938,15 +1009,22 @@ fn render_text_right_aligned(
     font: &Font,
     glyph_cache: &mut GlyphCache,
     text: &str,
-    right_x: usize,
-    y_offset: usize,
-    r: u8,
-    g: u8,
-    b: u8,
+    pos: Point,
+    color: Rgb,
 ) {
     let total_width = measure_text_width(glyph_cache, font, text, FONT_SIZE);
-    let start_x = right_x.saturating_sub(total_width);
-    render_text(pixels, font, glyph_cache, text, start_x, y_offset, r, g, b);
+    let start_x = pos.x.saturating_sub(total_width);
+    render_text(
+        pixels,
+        font,
+        glyph_cache,
+        text,
+        Point {
+            x: start_x,
+            y: pos.y,
+        },
+        color,
+    );
 }
 
 fn glyph_advance(glyph_cache: &mut GlyphCache, font: &Font, ch: char, font_size: f32) -> usize {
@@ -980,18 +1058,9 @@ fn cached_glyph<'a>(
     }
 }
 
-fn draw_glyph(
-    pixels: &mut [u8],
-    glyph: &CachedGlyph,
-    cursor_x: usize,
-    y_offset: usize,
-    line_height: usize,
-    r: u8,
-    g: u8,
-    b: u8,
-) {
-    let glyph_x = cursor_x as i32 + glyph.xmin;
-    let glyph_y = y_offset as i32 + (line_height as i32 - 4) - glyph.height as i32 - glyph.ymin;
+fn draw_glyph(pixels: &mut [u8], glyph: &CachedGlyph, pos: Point, line_height: usize, color: Rgb) {
+    let glyph_x = pos.x as i32 + glyph.xmin;
+    let glyph_y = pos.y as i32 + (line_height as i32 - 4) - glyph.height as i32 - glyph.ymin;
 
     let gy_start = (-glyph_y).clamp(0, glyph.height as i32) as usize;
     let gy_end = (HEIGHT as i32 - glyph_y).clamp(0, glyph.height as i32) as usize;
@@ -1010,35 +1079,32 @@ fn draw_glyph(
             }
 
             let px = (glyph_x + gx as i32) as usize;
-            let idx = (pixel_row + px) * 4;
+            let idx = (pixel_row + px) * 3;
 
             if coverage == 255 {
-                pixels[idx] = r;
-                pixels[idx + 1] = g;
-                pixels[idx + 2] = b;
+                pixels[idx] = color.r;
+                pixels[idx + 1] = color.g;
+                pixels[idx + 2] = color.b;
             } else {
                 let cov = coverage as u16;
                 let inv = 255 - cov;
-                pixels[idx] = ((r as u16 * cov + pixels[idx] as u16 * inv) / 255) as u8;
-                pixels[idx + 1] = ((g as u16 * cov + pixels[idx + 1] as u16 * inv) / 255) as u8;
-                pixels[idx + 2] = ((b as u16 * cov + pixels[idx + 2] as u16 * inv) / 255) as u8;
+                pixels[idx] = ((color.r as u16 * cov + pixels[idx] as u16 * inv) / 255) as u8;
+                pixels[idx + 1] =
+                    ((color.g as u16 * cov + pixels[idx + 1] as u16 * inv) / 255) as u8;
+                pixels[idx + 2] =
+                    ((color.b as u16 * cov + pixels[idx + 2] as u16 * inv) / 255) as u8;
             }
         }
     }
-}
-
-fn trim_line_ending(line: &str) -> &str {
-    line.strip_suffix("\r\n")
-        .or_else(|| line.strip_suffix('\n'))
-        .or_else(|| line.strip_suffix('\r'))
-        .unwrap_or(line)
 }
 
 fn encode_png(pixels: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(WIDTH * HEIGHT / 2);
     {
         let mut encoder = png::Encoder::new(&mut buf, WIDTH as u32, HEIGHT as u32);
-        encoder.set_color(png::ColorType::Rgba);
+        // The buffer is opaque RGB; an alpha plane would only add 25% more
+        // bytes through filtering/deflate and to every served PNG.
+        encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fastest);
         let mut writer = encoder.write_header().expect("PNG header write failed");

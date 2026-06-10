@@ -15,15 +15,22 @@ use syntect::parsing::SyntaxSet;
 use time::OffsetDateTime;
 use tracing::{error, info};
 
-use crate::{db::migrate_db, preview, routes::app_router, state::AppState};
+use crate::{
+    db::migrate_db,
+    preview,
+    routes::app_router,
+    state::{AppState, KeyedMutex},
+};
 
 pub struct Config {
     pub database_url: String,
+    pub base_url: Option<String>,
     pub host: String,
     pub port: u16,
     pub max_paste_size: usize,
     pub classifier_max_bytes: usize,
     pub highlight_max_bytes: usize,
+    pub render_cache_max_entry_bytes: usize,
     pub render_cache_capacity: NonZeroUsize,
     pub cleanup_interval: u64,
     pub db_min_connections: u32,
@@ -34,6 +41,19 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://rustbin.db".into());
+        let base_url = std::env::var("BASE_URL")
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(base) = &base_url {
+            // A schemeless base (e.g. "bin.example.com") would make every
+            // returned paste URL a relative path; fail fast at startup instead.
+            if !base.starts_with("http://") && !base.starts_with("https://") {
+                return Err(format!(
+                    "BASE_URL must start with http:// or https://, got: {base}"
+                ));
+            }
+        }
         let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
         let port = parse_env("PORT", 3000)?;
         let max_paste_size = match std::env::var("MAX_PASTE_SIZE") {
@@ -51,6 +71,12 @@ impl Config {
                 .ok_or_else(|| format!("invalid value for HIGHLIGHT_MAX_BYTES: {value}"))?,
             Err(_) => 256 * 1024,
         };
+        let render_cache_max_entry_bytes = match std::env::var("RENDER_CACHE_MAX_ENTRY_BYTES") {
+            Ok(value) => parse_byte_size(&value).ok_or_else(|| {
+                format!("invalid value for RENDER_CACHE_MAX_ENTRY_BYTES: {value}")
+            })?,
+            Err(_) => 2 * 1024 * 1024,
+        };
         let render_cache_capacity = parse_env("RENDER_CACHE_CAPACITY", 128)?;
         let render_cache_capacity = NonZeroUsize::new(render_cache_capacity)
             .ok_or("RENDER_CACHE_CAPACITY must be non-zero")?;
@@ -60,11 +86,13 @@ impl Config {
 
         Ok(Self {
             database_url,
+            base_url,
             host,
             port,
             max_paste_size,
             classifier_max_bytes,
             highlight_max_bytes,
+            render_cache_max_entry_bytes,
             render_cache_capacity,
             cleanup_interval,
             db_min_connections,
@@ -126,10 +154,14 @@ pub async fn run() -> Result<(), String> {
         syntax_index_by_token,
         classifier_max_bytes: config.classifier_max_bytes,
         highlight_max_bytes: config.highlight_max_bytes,
+        render_cache_max_entry_bytes: config.render_cache_max_entry_bytes,
         render_cache: Arc::new(Mutex::new(LruCache::new(config.render_cache_capacity))),
         preview_cache: Arc::new(Mutex::new(LruCache::new(config.render_cache_capacity))),
+        render_locks: Arc::new(KeyedMutex::default()),
+        preview_locks: Arc::new(KeyedMutex::default()),
         theme: Arc::new(theme),
         font,
+        base_url: config.base_url.clone(),
     });
 
     tokio::spawn(cleanup_expired_pastes(

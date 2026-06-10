@@ -2,36 +2,59 @@ pub const FONT_URL: &str =
     "https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&display=swap";
 pub const PASTE_JS: &str = r##"
 (function(){
-    function applyRange(){
-        document.querySelectorAll(".code-line.is-selected").forEach(function(el){
+    // Signals the stylesheet that JS owns line highlighting; disables the
+    // no-JS :target fallback so a stale :target from an earlier navigation
+    // can't show a second highlight.
+    document.documentElement.classList.add("js-lines");
+    function applyRange(scroll){
+        document.querySelectorAll(".code-grid code.is-selected").forEach(function(el){
             el.classList.remove("is-selected");
         });
-        var m = location.hash.match(/^#L(\d+)-L?(\d+)$/);
+        var m = location.hash.match(/^#L(\d+)(?:-L?(\d+))?$/);
         if (!m) return;
-        var lo = Math.min(+m[1], +m[2]), hi = Math.max(+m[1], +m[2]);
+        var lo = +m[1], hi = +(m[2] || m[1]);
+        if (lo > hi) { var t = lo; lo = hi; hi = t; }
         for (var i = lo; i <= hi; i++) {
             var el = document.getElementById("L" + i);
             if (el) el.classList.add("is-selected");
         }
-        var first = document.getElementById("L" + lo);
-        if (first) first.scrollIntoView({ block: "center" });
+        // Single-line fragments scroll natively (the fragment is the line's
+        // id); only ranges, which match no element id, need help.
+        if (scroll && m[2]) {
+            var first = document.getElementById("L" + lo);
+            if (first) first.scrollIntoView({ block: "center" });
+        }
     }
     document.addEventListener("click", function(e) {
-        var a = e.target.closest(".line-link");
-        if (!a || !e.shiftKey) return;
+        var a = e.target.closest(".code-grid code > a");
+        if (!a || e.ctrlKey || e.metaKey || e.altKey) return;
+        // replaceState instead of navigation: updates the URL and highlight
+        // without the browser scrolling a line you can already see.
         e.preventDefault();
-        var m = location.hash.match(/^#L(\d+)/);
-        if (!m) return;
-        var s = +m[1], c = +a.dataset.lineNumber;
-        location.hash = "L" + Math.min(s, c) + "-L" + Math.max(s, c);
+        var hash = a.hash;
+        if (e.shiftKey) {
+            var m = location.hash.match(/^#L(\d+)/);
+            if (m) {
+                var s = +m[1], c = +a.hash.slice(2);
+                hash = "#L" + Math.min(s, c) + "-L" + Math.max(s, c);
+            }
+        }
+        history.replaceState(null, "", hash);
+        applyRange(false);
     });
-    addEventListener("hashchange", applyRange);
-    applyRange();
+    addEventListener("hashchange", function(){ applyRange(true); });
+    applyRange(true);
 })();
 "##;
 
 pub const APP_CSS: &str = r#"
 :root {
+    /* Dark form controls; also the scrollbar fallback where the custom
+       styles below aren't supported. */
+    color-scheme: dark;
+    /* .foot (40px) + .kopirite (32px); the paste view's scroll container is
+       sized to end where the fixed footer begins. */
+    --footer-h: 72px;
     --bg: #0a0c10;
     --panel: #161b22;
     --panel-2: #0f141b;
@@ -48,6 +71,10 @@ pub const APP_CSS: &str = r#"
     --danger: #ff9492;
     --border: #272b33;
     --hover: #71b7ff1f;
+    /* Neutral on purpose: the accent is the footer's brand strip, and an
+       accent scrollbar thumb sitting right above it reads as part of it. */
+    --scroll-thumb: #2f3742;
+    --scroll-thumb-hover: #485463;
 }
 
 * {
@@ -55,16 +82,39 @@ pub const APP_CSS: &str = r#"
     color: var(--fg);
     margin: 0;
     box-sizing: border-box;
-    scrollbar-width: none;
     font-family: 'DM Mono', monospace;
-}
-
-*::-webkit-scrollbar {
-    display: none;
 }
 
 ::selection {
     background-color: var(--selection);
+}
+
+/* Slim custom scrollbars: transparent track, rounded accent thumb. */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    border-radius: 8px;
+    background-color: var(--scroll-thumb);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scroll-thumb-hover);
+}
+
+/* Firefox has no ::-webkit-scrollbar; this is its closest equivalent. */
+@supports not selector(::-webkit-scrollbar) {
+    * {
+        scrollbar-width: thin;
+        scrollbar-color: var(--scroll-thumb) transparent;
+    }
 }
 
 pre {
@@ -77,9 +127,20 @@ pre {
     line-height: inherit;
 }
 
+/* Viewport-height scroll container ending where the fixed footer begins, so
+   both scrollbars always sit at the viewport edges — without this the pre
+   grows to document height and its horizontal scrollbar lands at the bottom
+   of a possibly 100k-line page. */
 .paste-content {
     margin-left: 0;
     margin-right: 0;
+    height: calc(100vh - var(--footer-h));
+    height: calc(100dvh - var(--footer-h));
+    /* overflow-x scroll, not auto: the gutter is always reserved, so the bar
+       can't blink in/out above the footer as lazy chunks refine the grid's
+       width. With a transparent track it's invisible when nothing overflows. */
+    overflow-y: auto;
+    overflow-x: scroll;
 }
 
 .code-grid {
@@ -88,17 +149,24 @@ pre {
 }
 
 pre code {
-    display: grid;
-    grid-template-columns: auto 1fr;
-    min-width: 100%;
-    width: 100%;
+    display: block;
     min-height: 1.5em;
     scroll-margin-top: 20vh;
 }
 
-.line-link {
+/* Lazy-rendered group of paste lines: off-screen chunks are skipped for
+   layout/paint (their inline contain-intrinsic-size hint stands in for their
+   geometry) but stay in the DOM, so find-in-page, #L<n> navigation, selection
+   and copying cover the whole paste. */
+.code-chunk {
+    content-visibility: auto;
+}
+
+/* Line-number gutter. --ln is set by the renderer when line numbers exceed
+   four digits; the default fits up to 9999. */
+.code-grid code > a {
     display: inline-block;
-    min-width: 3.8em;
+    min-width: var(--ln, 3.8em);
     padding: 0 1em 0.3em 0;
     margin-right: .2em;
     color: var(--muted);
@@ -108,34 +176,22 @@ pre code {
     text-decoration: none;
 }
 
-.line-link:hover {
+.code-grid code > a:hover {
     color: var(--accent);
     text-decoration: underline;
 }
 
-.line-content {
-    min-width: 0;
-    white-space: pre;
-    overflow-wrap: normal;
-    word-break: normal;
-}
-
-.code-line.is-selected {
+/* :target is the no-JS fallback; with JS active (html.js-lines) highlighting
+   is done via .is-selected so clicking lines can use replaceState (no scroll)
+   without leaving a stale :target highlight behind. */
+.code-grid code.is-selected,
+html:not(.js-lines) .code-grid code:target {
     background-color: var(--anchor-selection);
     box-shadow: inset 2px 0 0 var(--anchor-selection-border);
 }
 
-.code-line.is-selected .line-link {
-    color: var(--anchor-selection-number);
-    text-decoration: none;
-}
-
-.code-line:target {
-    background-color: var(--anchor-selection);
-    box-shadow: inset 2px 0 0 var(--anchor-selection-border);
-}
-
-.code-line:target .line-link {
+.code-grid code.is-selected > a,
+html:not(.js-lines) .code-grid code:target > a {
     color: var(--anchor-selection-number);
     text-decoration: none;
 }
@@ -152,6 +208,9 @@ footer {
     width: 100%;
     background-color: var(--panel);
     user-select: none;
+    /* The footer precedes the page content in the DOM (so it's in the first
+       paint); keep it above any positioned content that follows. */
+    z-index: 1;
 }
 
 .foot {
@@ -307,6 +366,10 @@ body > hr {
     line-height: 1.6;
     word-wrap: break-word;
     max-width: 900px;
+    /* Same viewport-height scroll container as .paste-content. */
+    height: calc(100vh - var(--footer-h));
+    height: calc(100dvh - var(--footer-h));
+    overflow: auto;
 }
 
 .markdown-body h1,

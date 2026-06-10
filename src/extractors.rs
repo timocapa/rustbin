@@ -12,14 +12,20 @@ pub async fn parse_create_paste_multipart(mut multipart: Multipart) -> AppResult
         let name = field.name().unwrap_or_default().to_string();
         match name.as_str() {
             "file" => {
-                form.filename = field.file_name().map(str::to_string);
+                let filename = field.file_name().map(str::to_string);
                 let value = field.text().await.map_err(bad_request)?;
-                form.content = Some(value);
+                // Only take the filename when this field actually supplies
+                // content; the name of a discarded empty upload must not drive
+                // language detection for content from another field.
+                if !value.is_empty() {
+                    form.filename = filename;
+                }
+                set_content(&mut form, value);
             }
             "content" => {
                 form.from_browser = true;
                 let value = field.text().await.map_err(bad_request)?;
-                form.content = Some(value);
+                set_content(&mut form, value);
             }
             "expires_in" => {
                 let value = field.text().await.map_err(bad_request)?;
@@ -38,4 +44,13 @@ pub async fn parse_create_paste_multipart(mut multipart: Multipart) -> AppResult
     }
 
     Ok(form)
+}
+
+/// Assign paste content, but never let an empty value (e.g. an empty file
+/// upload) overwrite content already provided by another field. Field order in
+/// the multipart body therefore can't silently discard the real paste.
+fn set_content(form: &mut CreatePasteForm, value: String) {
+    if !value.is_empty() || form.content.is_none() {
+        form.content = Some(value);
+    }
 }
