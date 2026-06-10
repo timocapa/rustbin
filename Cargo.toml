@@ -1,6 +1,6 @@
 [package]
 name = "rustbin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 default-run = "rustbin"
 
@@ -17,7 +17,7 @@ nanoid = "0.5"
 parking_lot = "0.12"
 png = "0.18"
 pulldown-cmark = "0.13"
-sqlx = { version = "0.8", features = ["macros", "migrate", "runtime-tokio-rustls", "sqlite"] }
+sqlx = { version = "0.9", features = ["macros", "migrate", "runtime-tokio", "sqlite"] }
 sublime-color-scheme = "0.1.5"
 syntect = { version = "5", default-features = false, features = ["html", "regex-onig", "yaml-load", "dump-load", "dump-create"] }
 time = "0.3"
